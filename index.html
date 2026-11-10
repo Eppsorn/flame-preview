@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Flame preview v3</title>
+<style>
+  html,body{margin:0;height:100%;background:#030304;overflow:hidden;touch-action:manipulation;}
+  canvas{position:fixed;inset:0;width:100vw;height:100vh;height:100dvh;display:block;}
+  #start{position:fixed;inset:0;display:flex;align-items:flex-end;justify-content:center;padding-bottom:12vh;
+    cursor:pointer;color:rgba(255,255,255,.55);font:300 13px/1.4 -apple-system,Helvetica,Arial,sans-serif;letter-spacing:.3em;
+    text-transform:uppercase;-webkit-user-select:none;user-select:none;transition:opacity .8s}
+  #start.hide{opacity:0;pointer-events:none}
+  #dev{position:fixed;top:10px;right:10px;width:250px;padding:12px 14px;background:rgba(18,18,22,.86);color:#ddd;
+    font:12px/1.3 ui-monospace,Menlo,monospace;border:1px solid #333;border-radius:8px;display:none;z-index:5;
+    max-height:46vh;overflow:auto}
+  @media (max-width:500px){#dev{width:auto;left:10px;font-size:11px;padding:8px 10px}#dev label{margin:4px 0 0}}
+  #dev.show{display:block}
+  #dev label{display:block;margin:7px 0 1px} #dev input[type=range]{width:100%}
+  #dev .v{float:right;color:#fff} #dev button{margin-top:8px;margin-right:4px;background:#2a2a30;color:#ddd;border:1px solid #444;border-radius:4px;padding:4px 7px;font:inherit}
+  #dev .meters{margin-top:8px;color:#9a9}
+  #dev textarea{width:100%;height:42px;margin-top:6px;background:#111;color:#bdb;border:1px solid #333;font:11px ui-monospace,monospace}
+  #devbtn{position:fixed;right:0;top:0;width:44px;height:44px;z-index:4}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="start">tap to begin</div>
+<div id="devbtn" title="triple-tap: dev panel"></div>
+<div id="dev">
+  <b>Flame v3 · dev</b>
+  <div id="sliders"></div>
+  <button id="mode"></button><button id="reset">Reset</button><button id="hide">Hide</button>
+  <div class="meters" id="meters"></div>
+  <textarea id="vals" readonly></textarea>
+</div>
+<script>
+"use strict";
+const Q = new URLSearchParams(location.search);
+const RENDER = Q.has('render');
+let FULL = Q.get('full') === '1';
+// ---- track config: to swap in a new track, drop its files next to this page and edit these three names
+// (or pass ?clip=...&full=...&timeline=... in the URL). Build the timeline with tools/build_pulse_timeline.py.
+const AUDIO = { clip: Q.get('clip') || 'calm_cool_loop_v8_first5s.wav', full: Q.get('full_src') || 'calm_cool_loop_v8_full.wav' };
+const TIMELINE_URL = Q.get('timeline') || 'pulse_timeline_v8.json';
+let TL = { duration: 60, onsets: [] };
+const TEX_ASPECT = 640/764;
+
+// ---------- tweakable parameters (dev panel) ----------
+const DEFAULTS = { size:1.00, pulse:1.00, flicker:1.00, glow:1.00, ripple:1.00, embers:56 };
+const RANGES = { size:[0.5,1.6,0.01], pulse:[0,2.5,0.01], flicker:[0,2.5,0.01], glow:[0,2,0.01], ripple:[0,2.5,0.01], embers:[0,64,1] };
+const LABEL = { size:'Flame size', pulse:'Bass pulse strength', flicker:'Flicker amount', glow:'Glow', ripple:'Ripple strength', embers:'Ember count' };
+const P = {...DEFAULTS};
+for (const k in P) if (Q.has(k)) P[k] = parseFloat(Q.get(k));
+
+// ---------- WebGL ----------
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2', { antialias:false, premultipliedAlpha:false, preserveDrawingBuffer:RENDER });
+if (!gl) document.body.insertAdjacentHTML('beforeend','<p style="color:#888;position:fixed;top:40%;width:100%;text-align:center;font-family:sans-serif">WebGL2 not available</p>');
+
+const VS = `#version 300 es
+in vec2 a; void main(){ gl_Position = vec4(a,0.,1.); }`;
+const NR = 6;
+const FS = `#version 300 es
+precision highp float;
+out vec4 o;
+uniform sampler2D uTex;
+uniform vec2 uRes; uniform float uT, uAsp;
+uniform float uSize, uPulseAmt, uFlicker, uGlow, uRipple, uEmbers;
+uniform float uPulse, uHi;
+uniform vec3 uR[${NR}];   // ripple: age, strength, -
+float h1(float n){ return fract(sin(n*127.1)*43758.5453); }
+float h2(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  return mix(mix(h2(i),h2(i+vec2(1,0)),f.x), mix(h2(i+vec2(0,1)),h2(i+vec2(1,1)),f.x), f.y); }
+float fbm(vec2 p){ float s=0., a=.5; mat2 m=mat2(1.6,1.2,-1.2,1.6); for(int i=0;i<4;i++){ s+=a*vn(p); p=m*p; a*=.5; } return s; }
+
+float flameH(float pulse){ return uSize * (1.0 + 0.06*pulse*uPulseAmt); }
+// scene point -> texture uv (base centre of the painting at (0.5, 0))
+vec2 toUV(vec2 p, float H){ return vec2(p.x/(H*uAsp) + 0.5, p.y/H); }
+// calm burning: upward-scrolling noise displacement, zero at the base, strongest at the tips
+vec2 burn(vec2 uv, float t){
+  float h = clamp(uv.y, 0.0, 1.0);
+  float k = pow(h, 1.5) * uFlicker;
+  float n1 = fbm(vec2(uv.x*3.2, uv.y*2.6 - t*0.85));
+  float n2 = fbm(vec2(uv.x*6.5 + 4.0, uv.y*5.0 - t*1.35));
+  vec2 off = vec2((n1-0.5)*0.060 + (n2-0.5)*0.022, (n2-0.5)*0.030 - 0.012*k) * k;
+  off.x += (vn(vec2(t*0.25, 2.0)) - 0.5) * 0.030 * h*h * uFlicker;     // slow gentle sway
+  return uv + off;
+}
+vec4 tex(vec2 uv, float lod){
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return vec4(0.0);
+  return textureLod(uTex, uv, lod);
+}
+
+void main(){
+  vec2 fc = gl_FragCoord.xy;
+  bool portrait = uRes.x < uRes.y;
+  float unit = min(uRes.y*0.98, uRes.x*(portrait ? 1.05 : 1.30)) * 0.68;
+  vec2 base = vec2(uRes.x*0.5, uRes.y*(portrait ? 0.30 : 0.15));
+  vec2 p = (fc - base) / unit;
+  vec3 col = vec3(0.004, 0.004, 0.006);
+  float H = flameH(uPulse);
+  float pulseLight = 1.0 + 0.35*uPulse*uPulseAmt;
+
+  // heat shimmer from the highs (only affects the upper flame)
+  vec2 ps = p;
+  ps.x += sin(p.y*42.0 - uT*5.0 + sin(p.x*18.0)) * 0.0022 * smoothstep(0.45, 1.0, p.y/H) * (0.3 + uHi);
+
+  // ---------- the painted flame ----------
+  vec2 uv = burn(toUV(ps, H), uT);
+  vec4 F = tex(uv, 0.0);
+  // gentle rising internal brightness variation (the flame "burns" inside)
+  float inner = 0.90 + 0.16*fbm(vec2(uv.x*5.0, uv.y*2.2 - uT*0.9));
+  vec3 flame = F.rgb * inner * 0.96 * pulseLight;
+  float occ = F.a;                                   // flame silhouette, hides things behind it
+
+  // ---------- floor ----------
+  float pool = exp(-(p.x*p.x*2.2 + p.y*p.y*55.0)) * 0.20 * (0.6+0.4*uGlow) * pulseLight;
+  col += vec3(0.86,0.88,0.94) * pool;
+  // ripples: concentric ellipses in perspective, from the base
+  {
+    vec2 e = vec2(p.x, p.y*4.5);
+    float r = length(e), acc = 0.0;
+    for (int i=0;i<${NR};i++){
+      vec3 R = uR[i]; if (R.y <= 0.0) continue;
+      float age = R.x, rad = 0.26 + age*0.55, w = 0.010 + age*0.016;
+      float life = clamp(1.0 - age/3.6, 0.0, 1.0);
+      acc += exp(-pow((r - rad)/w, 2.0)) * R.y * life*life * (0.35 + 0.65*smoothstep(0.0,0.4,age));
+    }
+    float behind = mix(1.0, 0.55, smoothstep(-0.01, 0.03, p.y));
+    col += vec3(0.80,0.84,0.92) * acc * 0.085 * uRipple * behind * smoothstep(3.0, 0.5, r);
+  }
+  // reflection: mirrored, blurred, fading into the floor
+  if (p.y < 0.0) {
+    vec2 rp = vec2(p.x + sin(p.y*70.0 + uT*1.2)*0.003, -p.y*1.25);
+    vec2 ruv = burn(toUV(rp, H), uT);
+    float fade = exp(p.y*9.0);
+    col += tex(ruv, 4.5).rgb * 0.26 * fade * pulseLight;
+    col += vec3(1.0) * exp(-pow(p.y/0.018,2.0)) * exp(-p.x*p.x*9.0) * 0.08 * pulseLight;   // contact light
+  }
+
+  // ---------- glow (mids/pad + bass pulse) ----------
+  vec2 guv = toUV(p, H);
+  vec3 g1 = tex(guv, 2.2).rgb, g2 = tex(vec2((guv.x-0.5)*0.8+0.5, guv.y*0.9), 5.5).rgb;
+  float gk = uGlow * (0.70 + 0.55*uPulse*uPulseAmt);
+  vec3 glow = (g1*0.22 + g2*0.30) * gk * (p.y < 0.0 ? 0.5 : 1.0);
+  // soft atmospheric halo
+  float gd = length((p - vec2(0.0, 0.42*H)) * vec2(1.4, 0.9) / H);
+  glow += vec3(0.80,0.84,0.95) * exp(-gd*gd*2.0) * 0.06 * gk;
+
+  // ---------- embers: small bright sparks rising around the flame ----------
+  {
+    float acc = 0.0;
+    for (int i=0;i<64;i++){
+      if (float(i) >= uEmbers) break;
+      float fi = float(i);
+      float per = 5.0 + 4.0*h1(fi+1.3);
+      float ph = fract(uT/per + h1(fi+7.7));
+      float side = h1(fi+3.1) - 0.5;
+      float x0 = side * 0.95 * (0.30 + 0.70*h1(fi+4.4));
+      vec2 ep = vec2(x0*(1.0 - ph*0.45) + 0.035*sin(uT*(0.5+h1(fi+9.0)) + fi)*ph, (0.20 + 0.45*h1(fi+6.6) + ph*0.95)) * uSize;
+      float sz = (0.0028 + 0.0035*h1(fi+5.5));
+      vec2 d = (p - ep) * vec2(1.0, 0.55);                // slightly elongated vertically, like the painting
+      float al = smoothstep(0.0,0.12,ph) * smoothstep(1.0,0.6,ph) * (0.45+0.55*h1(fi+2.2)) * (0.75 + 0.25*sin(uT*3.0 + fi*2.1));
+      float dd = length(d);
+      acc += (exp(-pow(dd/sz,2.0))*1.3 + exp(-dd/(sz*2.5))*0.12) * al;
+    }
+    col += vec3(0.96,0.97,1.0) * acc;
+  }
+  // faint air sparkle (highs)
+  {
+    vec2 g = p*60.0; vec2 id = floor(g); float rnd = h2(id);
+    if (rnd > 0.988 && p.y > 0.0) {
+      vec2 f = fract(g) - 0.5;
+      float tw = pow(0.5+0.5*sin(uT*2.0 + rnd*80.0), 6.0);
+      float near = exp(-length((p - vec2(0.,0.55*H))*vec2(1.2,0.8))*1.8);
+      col += vec3(0.9,0.93,1.0) * exp(-dot(f,f)*40.0) * tw * near * (0.04 + 0.20*uHi);
+    }
+  }
+
+  // composite: things behind the flame are hidden by its body, the painted flame is added on top
+  col *= (1.0 - 0.85*occ);
+  col += glow + flame;
+  col = 1.0 - exp(-col*1.6);
+  col += (h2(fc + fract(uT)*91.0) - 0.5)/255.0;
+  o = vec4(col, 1.0);
+}`;
+function sh(type, src){ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error(gl.getShaderInfoLog(s)); } return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.bindAttribLocation(prog, 0, 'a'); gl.linkProgram(prog); gl.useProgram(prog);
+const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const U = {}; for (const n of ['uTex','uRes','uT','uAsp','uSize','uPulseAmt','uFlicker','uGlow','uRipple','uEmbers','uPulse','uHi','uR']) U[n] = gl.getUniformLocation(prog, n);
+
+// flame texture (cut from the painted reference)
+let texReady = false;
+const texP = new Promise((res, rej) => { const img = new Image(); img.onload = () => {
+  const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.uniform1i(U.uTex, 0); texReady = true; res(); }; img.onerror = rej; img.src = 'flame_tex.png'; });
+
+function resize(){
+  const dpr = RENDER ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
+  const w = Math.round(cv.clientWidth * dpr), h = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  gl.viewport(0, 0, cv.width, cv.height);
+}
+
+// ---------- audio analysis (shared by live + offline render) ----------
+const FFT_N = 2048;
+const BANDS = { bass:[40,160], mid:[250,2000], hi:[3500,12000] };
+let sampleRate = 44100, binIdx = null;
+function makeBins(sr){ sampleRate = sr; binIdx = {}; for (const k in BANDS){ const [lo,hi] = BANDS[k];
+  binIdx[k] = [Math.max(1, Math.round(lo*FFT_N/sr)), Math.min(FFT_N/2-1, Math.round(hi*FFT_N/sr))]; } }
+function bandsFromDb(db){ const out = {}; for (const k in binIdx){ const [a,b] = binIdx[k]; let s = 0;
+  for (let i=a;i<=b;i++){ const m = Math.pow(10, db[i]/20); s += m*m; } out[k] = Math.sqrt(s/(b-a+1)); } return out; }
+
+// JS emulation of AnalyserNode.getFloatFrequencyData (Blackman window, |X|/N, dB, smoothing 0)
+const win = new Float32Array(FFT_N); for (let i=0;i<FFT_N;i++){ const x = i/FFT_N; win[i] = 0.42 - 0.5*Math.cos(2*Math.PI*x) + 0.08*Math.cos(4*Math.PI*x); }
+const re = new Float32Array(FFT_N), im = new Float32Array(FFT_N), dbBuf = new Float32Array(FFT_N/2);
+function fft(){ const n = FFT_N; for (let i=1,j=0;i<n;i++){ let bit = n>>1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i<j){ let t=re[i]; re[i]=re[j]; re[j]=t; t=im[i]; im[i]=im[j]; im[j]=t; } }
+  for (let len=2; len<=n; len<<=1){ const ang = -2*Math.PI/len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i=0;i<n;i+=len){ let cr=1, ci=0; for (let k=0;k<len/2;k++){ const a=i+k, b=a+len/2;
+      const xr = re[b]*cr - im[b]*ci, xi = re[b]*ci + im[b]*cr; re[b]=re[a]-xr; im[b]=im[a]-xi; re[a]+=xr; im[a]+=xi;
+      const t = cr*wr - ci*wi; ci = cr*wi + ci*wr; cr = t; } } } }
+let mono = null;
+function offlineDb(t){ const len = mono.length; let end = Math.floor(t*sampleRate);
+  for (let i=0;i<FFT_N;i++){ let idx = end - FFT_N + i; idx = ((idx % len) + len) % len; re[i] = mono[idx]*win[i]; im[i] = 0; }
+  fft(); for (let k=0;k<FFT_N/2;k++){ const m = Math.hypot(re[k], im[k]) / FFT_N; dbBuf[k] = 20*Math.log10(m + 1e-12); } return dbBuf; }
+
+let REF = { bass:1, mid:1, hi:1 };
+function calibrate(){ // per-band 92nd percentile over the loop, so reactions are level-independent and identical live/offline
+  const vals = { bass:[], mid:[], hi:[] }; const dur = mono.length/sampleRate;
+  for (let t=0.05; t<dur; t+=1/20){ const b = bandsFromDb(offlineDb(t)); for (const k in vals) vals[k].push(b[k]); }
+  for (const k in vals){ const a = vals[k].sort((x,y)=>x-y); REF[k] = Math.max(a[Math.floor(a.length*0.92)], 1e-6); }
+}
+
+// ---------- drum pulse, driven by the precomputed timeline (not live FFT) ----------
+// Each onset of the deep drum stem gives a soft ~90 ms swell and a slow ease back, plus one floor ripple.
+const PULSE_ATTACK = 0.09, PULSE_DECAY = 0.55, RIPPLE_LIFE = 3.6;
+let loopDur = 5;                       // length of the audio loop currently playing (clip or full)
+const S = { pulse:0, hi:0 };
+const ease = (tau, dt) => 1 - Math.exp(-dt / tau);
+const ripples = [];                    // [{age, s}]
+function activeOnsets(){ return TL.onsets.filter(o => o.t < loopDur - 1e-3); }
+function timelineState(tl){            // tl = position inside the loop, seconds
+  let pulse = 0; ripples.length = 0;
+  for (const o of activeOnsets()){
+    const age = ((tl - o.t) % loopDur + loopDur) % loopDur;       // wraps across the loop seam
+    const a = Math.min(age / PULSE_ATTACK, 1), sm = a*a*(3-2*a);
+    pulse = Math.max(pulse, o.s * sm * Math.exp(-Math.max(age - PULSE_ATTACK*0.5, 0) / PULSE_DECAY));
+    if (age < RIPPLE_LIFE) ripples.push({ age, s: 0.55 + 0.45*o.s });
+  }
+  ripples.sort((x,y)=>x.age-y.age); ripples.length = Math.min(ripples.length, NR);
+  return pulse;
+}
+function react(hiBand, dt, tl){
+  S.pulse = tl == null ? 0 : timelineState(tl);
+  const H = Math.min(hiBand/REF.hi, 1.6);
+  S.hi += (H - S.hi) * ease(0.5, dt);
+  window.__meters = { pulse:S.pulse, H };
+}
+
+const rArr = new Float32Array(NR*3);
+function draw(t){
+  resize();
+  rArr.fill(0);
+  ripples.forEach((r,i)=> rArr.set([r.age, r.s, 0], i*3));
+  gl.uniform2f(U.uRes, cv.width, cv.height); gl.uniform1f(U.uT, t); gl.uniform1f(U.uAsp, TEX_ASPECT);
+  gl.uniform1f(U.uSize, P.size); gl.uniform1f(U.uPulseAmt, P.pulse); gl.uniform1f(U.uFlicker, P.flicker); gl.uniform1f(U.uGlow, P.glow);
+  gl.uniform1f(U.uRipple, P.ripple); gl.uniform1f(U.uEmbers, P.embers);
+  gl.uniform1f(U.uPulse, Math.min(S.pulse,1.3)); gl.uniform1f(U.uHi, Math.min(S.hi,1.3));
+  gl.uniform3fv(U.uR, rArr);
+  if (texReady) gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// ---------- audio loading / playback ----------
+let actx = null, analyser = null, src = null, buffers = {}, playing = false, startAt = 0;
+const tlP = fetch(TIMELINE_URL).then(r => r.json()).then(j => { TL = j; }).catch(e => console.error('timeline', e));
+const floatDb = new Float32Array(FFT_N/2);
+async function loadBuffer(name, ctx){
+  if (buffers[name]) return buffers[name];
+  const ab = await (await fetch(AUDIO[name])).arrayBuffer();
+  const buf = await ctx.decodeAudioData(ab); buffers[name] = buf; return buf; }
+function setMono(buf){ makeBins(buf.sampleRate); mono = new Float32Array(buf.length);
+  const ch = buf.numberOfChannels; for (let c=0;c<ch;c++){ const d = buf.getChannelData(c); for (let i=0;i<d.length;i++) mono[i] += d[i]/ch; }
+  calibrate(); }
+async function startAudio(){
+  const name = FULL ? 'full' : 'clip';
+  if (!actx){ actx = new (window.AudioContext || window.webkitAudioContext)(); analyser = actx.createAnalyser();
+    analyser.fftSize = FFT_N; analyser.smoothingTimeConstant = 0; analyser.minDecibels = -140; analyser.maxDecibels = 0; analyser.connect(actx.destination); }
+  if (actx.state !== 'running') await actx.resume();
+  const buf = await loadBuffer(name, actx); setMono(buf);
+  if (src) { try { src.stop(); } catch(e){} }
+  src = actx.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(analyser);
+  await tlP; loopDur = buf.duration;
+  startAt = actx.currentTime + 0.05; src.start(startAt);
+  playing = true; updateModeBtn();
+}
+
+// ---------- live loop ----------
+let lastNow = performance.now(), tScene = 0;
+function frame(now){
+  const dt = Math.min((now - lastNow)/1000, 0.1); lastNow = now; tScene += dt;
+  if (playing){ analyser.getFloatFrequencyData(floatDb); for (let i=0;i<floatDb.length;i++) if (!isFinite(floatDb[i])) floatDb[i] = -200;
+    // visual time = what is being heard now: audio clock minus output latency, folded into the loop
+    const lat = (actx.outputLatency || 0) + (actx.baseLatency || 0);
+    const tl = Math.max(actx.currentTime - startAt - lat, 0) % loopDur;
+    react(bandsFromDb(floatDb).hi, dt, tl); }
+  else react(0, dt, null);   // calm burning before the tap
+  draw(tScene);
+  if (devEl.classList.contains('show') && window.__meters){ const m = window.__meters;
+    metersEl.textContent = `drum pulse ${m.pulse.toFixed(2)}  high ${m.H.toFixed(2)}\ntimeline: ${TL.track || '?'} (${activeOnsets().length} hits/loop)`; }
+  requestAnimationFrame(frame);
+}
+
+// ---------- offline deterministic render API (used for the MP4 preview) ----------
+window.__prepRender = async (name) => { await texP; await tlP; const ctx = new OfflineAudioContext(2, 44100, 44100);
+  const buf = await loadBuffer(name || 'clip', ctx); setMono(buf); loopDur = buf.duration; return buf.duration; };
+window.__renderFrame = (i, fps) => { const dt = 1/fps, t = i*dt;
+  const tl = t % loopDur; react(bandsFromDb(offlineDb(t)).hi, dt, tl); draw(t); gl.finish();
+  const newHit = activeOnsets().some(o => { const age = ((tl - o.t) % loopDur + loopDur) % loopDur; return age < dt; });
+  return { waves: 0, ripples: newHit ? 1 : 0, pulse: S.pulse }; };
+
+// ---------- dev panel ----------
+const devEl = document.getElementById('dev'), metersEl = document.getElementById('meters'), valsEl = document.getElementById('vals');
+const slEl = document.getElementById('sliders');
+function showVals(){ valsEl.value = Object.entries(P).map(([k,v])=>`${k}=${(+v).toFixed(k==='embers'?0:2)}`).join('&');
+  for (const k in P){ const e = document.getElementById('v_'+k); if (e) e.textContent = (+P[k]).toFixed(k==='embers'?0:2); } }
+for (const k in P){ const [mn,mx,st] = RANGES[k];
+  slEl.insertAdjacentHTML('beforeend', `<label>${LABEL[k]} <span class="v" id="v_${k}"></span></label><input type="range" id="s_${k}" min="${mn}" max="${mx}" step="${st}" value="${P[k]}">`); }
+for (const k in P) document.getElementById('s_'+k).addEventListener('input', e => { P[k] = parseFloat(e.target.value); showVals(); });
+document.getElementById('reset').onclick = () => { Object.assign(P, DEFAULTS); for (const k in P) document.getElementById('s_'+k).value = P[k]; showVals(); };
+const modeBtn = document.getElementById('mode');
+function updateModeBtn(){ modeBtn.textContent = FULL ? 'Audio: full 60 s' : 'Audio: first 5 s'; }
+modeBtn.onclick = () => { FULL = !FULL; updateModeBtn(); if (playing) startAudio(); };
+updateModeBtn(); showVals();
+const toggleDev = () => devEl.classList.toggle('show');
+document.getElementById('hide').onclick = toggleDev;
+if (Q.get('dev') === '1') toggleDev();
+window.addEventListener('keydown', e => { if (e.key === 'd' || e.key === 'D') toggleDev(); });
+let taps = []; document.getElementById('devbtn').addEventListener('click', e => { e.stopPropagation(); const n = performance.now();
+  taps = taps.filter(x => n - x < 700); taps.push(n); if (taps.length >= 3){ taps = []; toggleDev(); } });
+
+// ---------- start ----------
+const startEl = document.getElementById('start');
+if (RENDER){ startEl.remove(); document.getElementById('devbtn').remove(); }
+else {
+  startEl.addEventListener('click', async () => { startEl.classList.add('hide');
+    try { await startAudio(); } catch(err){ console.error(err); startEl.textContent = 'audio failed to load – open via http(s), not file://'; startEl.classList.remove('hide'); } });
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
