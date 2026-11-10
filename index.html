@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
-<title>Flame preview v3</title>
+<title>Elric Flame v4 (private preview)</title>
 <style>
   html,body{margin:0;height:100%;background:#030304;overflow:hidden;touch-action:manipulation;}
   canvas{position:fixed;inset:0;width:100vw;height:100vh;height:100dvh;display:block;}
@@ -29,7 +29,7 @@
 <div id="start">tap to begin</div>
 <div id="devbtn" title="triple-tap: dev panel"></div>
 <div id="dev">
-  <b>Flame v3 · dev</b>
+  <b>Elric Flame v4 · dev</b>
   <div id="sliders"></div>
   <button id="mode"></button><button id="reset">Reset</button><button id="hide">Hide</button>
   <div class="meters" id="meters"></div>
@@ -42,15 +42,15 @@ const RENDER = Q.has('render');
 let FULL = Q.get('full') === '1';
 // ---- track config: to swap in a new track, drop its files next to this page and edit these three names
 // (or pass ?clip=...&full=...&timeline=... in the URL). Build the timeline with tools/build_pulse_timeline.py.
-const AUDIO = { clip: Q.get('clip') || 'calm_cool_loop_v8_first5s.wav', full: Q.get('full_src') || 'calm_cool_loop_v8_full.wav' };
+const AUDIO = { clip: Q.get('clip') || 'calm_cool_loop_v8_2bars.wav', full: Q.get('full_src') || 'calm_cool_loop_v8_full.wav' };
 const TIMELINE_URL = Q.get('timeline') || 'pulse_timeline_v8.json';
 let TL = { duration: 60, onsets: [] };
-const TEX_ASPECT = 640/764;
+const SDF_W = 640, SDF_H = 844, SDF_PX_PER_UNIT = 680, SDF_RANGE = 0.12*764/680;   // flame_sdf.png geometry
 
 // ---------- tweakable parameters (dev panel) ----------
-const DEFAULTS = { size:1.00, pulse:1.00, flicker:1.00, glow:1.00, ripple:1.00, embers:56 };
-const RANGES = { size:[0.5,1.6,0.01], pulse:[0,2.5,0.01], flicker:[0,2.5,0.01], glow:[0,2,0.01], ripple:[0,2.5,0.01], embers:[0,64,1] };
-const LABEL = { size:'Flame size', pulse:'Bass pulse strength', flicker:'Flicker amount', glow:'Glow', ripple:'Ripple strength', embers:'Ember count' };
+const DEFAULTS = { size:1.00, flicker:1.00, rim:1.00, glow:1.00, ripple:1.00, loopBars:1 };
+const RANGES = { size:[0.5,1.6,0.01], flicker:[0,2.5,0.01], rim:[0,2.5,0.01], glow:[0,2,0.01], ripple:[0,2.5,0.01], loopBars:[1,3,2] };
+const LABEL = { size:'Flame size', flicker:'Flicker amount', rim:'Rim width', glow:'Glow', ripple:'Ripple strength', loopBars:'Flame loop (bars, 1 or 3)' };
 const P = {...DEFAULTS};
 for (const k in P) if (Q.has(k)) P[k] = parseFloat(Q.get(k));
 
@@ -65,126 +65,116 @@ const NR = 6;
 const FS = `#version 300 es
 precision highp float;
 out vec4 o;
-uniform sampler2D uTex;
-uniform vec2 uRes; uniform float uT, uAsp;
-uniform float uSize, uPulseAmt, uFlicker, uGlow, uRipple, uEmbers;
-uniform float uPulse, uHi;
-uniform vec3 uR[${NR}];   // ripple: age, strength, -
-float h1(float n){ return fract(sin(n*127.1)*43758.5453); }
+uniform sampler2D uTex;           // signed distance field of Espen's flame silhouette
+uniform vec2 uRes; uniform float uPh, uSdfRange, uSdfRange2, uSdfAsp, uSdfTop;
+uniform float uSize, uFlicker, uRim, uGlow, uRipple;
+uniform vec3 uR[${NR}];           // ripple: age, strength, -
+const float TAU = 6.2831853;
 float h2(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
-float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
-  return mix(mix(h2(i),h2(i+vec2(1,0)),f.x), mix(h2(i+vec2(0,1)),h2(i+vec2(1,1)),f.x), f.y); }
-float fbm(vec2 p){ float s=0., a=.5; mat2 m=mat2(1.6,1.2,-1.2,1.6); for(int i=0;i<4;i++){ s+=a*vn(p); p=m*p; a*=.5; } return s; }
-
-float flameH(float pulse){ return uSize * (1.0 + 0.06*pulse*uPulseAmt); }
-// scene point -> texture uv (base centre of the painting at (0.5, 0))
-vec2 toUV(vec2 p, float H){ return vec2(p.x/(H*uAsp) + 0.5, p.y/H); }
-// calm burning: upward-scrolling noise displacement, zero at the base, strongest at the tips
-vec2 burn(vec2 uv, float t){
-  float h = clamp(uv.y, 0.0, 1.0);
-  float k = pow(h, 1.5) * uFlicker;
-  float n1 = fbm(vec2(uv.x*3.2, uv.y*2.6 - t*0.85));
-  float n2 = fbm(vec2(uv.x*6.5 + 4.0, uv.y*5.0 - t*1.35));
-  vec2 off = vec2((n1-0.5)*0.060 + (n2-0.5)*0.022, (n2-0.5)*0.030 - 0.012*k) * k;
-  off.x += (vn(vec2(t*0.25, 2.0)) - 0.5) * 0.030 * h*h * uFlicker;     // slow gentle sway
-  return uv + off;
+// value noise, periodic in y with period py cells (so upward scrolling by py cells per loop is seamless)
+float pn(vec2 p, float py){ vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+  vec2 i0 = vec2(i.x, mod(i.y, py)), i1 = vec2(i.x, mod(i.y + 1.0, py));
+  return mix(mix(h2(i0), h2(i0+vec2(1,0)), f.x), mix(h2(i1), h2(i1+vec2(1,0)), f.x), f.y); }
+// scene p (flame base at 0,0; flame height 1) -> silhouette signed distance (negative inside), in scene units
+float sil(vec2 p){
+  vec2 uv = vec2(0.5 + p.x*uSdfAsp, p.y*uSdfTop);
+  vec2 c = clamp(uv, vec2(0.002), vec2(0.998));
+  vec2 tx = texture(uTex, c).rg;
+  float fine = (tx.r - 0.5) * 2.0 * uSdfRange, coarse = (tx.g - 0.5) * 2.0 * uSdfRange2;
+  float d = abs(fine) < uSdfRange*0.95 ? fine : coarse;   // fine near the edge, coarse further out (for the glow)
+  return d + length(uv - c) / uSdfAsp;       // keep growing outside the texture
 }
-vec4 tex(vec2 uv, float lod){
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return vec4(0.0);
-  return textureLod(uTex, uv, lod);
+float smin(float a, float b, float k){ float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0); return mix(b, a, h) - k*h*(1.0-h); }
+// whole cartoon flame: returns (outer sd, core sd). Everything is a function of the loop phase uPh, so it loops exactly.
+vec2 flame(vec2 p){
+  p /= uSize;
+  float ph = uPh;
+  float h = clamp(p.y, 0.0, 1.3);
+  float k = pow(h, 1.35) * uFlicker;
+  // rising, loop-periodic wobble: noise scrolls up exactly one period per loop
+  float nx = pn(vec2(p.x*2.2 + 7.0, p.y*2.0 - ph*4.0), 4.0) - 0.5;
+  float ny = pn(vec2(p.x*2.2 + 3.0, p.y*2.0 - ph*4.0), 4.0) - 0.5;
+  float sway = sin(TAU*ph) * 0.018 * h*h * uFlicker;
+  vec2 q = p - vec2(nx*0.085 + sway, ny*0.05) * k;
+  float d = sil(q);
+  // tongues lick: the edge breathes in and out with a rising noise, stronger toward the tips
+  float lick = pn(vec2(p.x*5.0, p.y*4.0 - ph*8.0), 8.0) - 0.5;
+  d += lick * 0.03 * k;
+  // two detached blobs per loop break off the main tip and float up, shrinking
+  for (int i = 0; i < 2; i++){
+    float f = fract(ph*2.0 + float(i)*0.5);
+    vec2 bp = vec2(0.025 + sin(TAU*f)*0.015, 0.93 + f*0.24);
+    float live = smoothstep(0.0, 0.18, f) * smoothstep(1.0, 0.70, f);           // grows out of the tip, fades away
+    float r = 0.030 * pow(1.0 - f, 0.7) * live * min(uFlicker, 1.5);
+    d = smin(d, length(p - bp) - r + (1.0 - live)*0.25, 0.025);           // fully gone (no glow) before it wraps
+  }
+  d *= uSize;
+  // core = flat inner area. Rim width varies with a rising noise so rim-coloured bites eat into the core, cartoon style.
+  float bite = max(pn(vec2(p.x*7.0 + 11.0, p.y*5.0 - ph*10.0), 10.0) - 0.45, 0.0) * 0.12 * smoothstep(0.05, 0.5, h);
+  float core = d + (0.030*uRim + bite) * uSize;
+  core = max(core, d + 0.010*uSize);         // always keep at least a thin rim
+  return vec2(d, core);
 }
-
+vec3 BG = vec3(0.012, 0.012, 0.030);
+vec3 RIM = vec3(0.74, 0.80, 0.92);
+vec3 CORE = vec3(1.0);
+vec3 GLOW = vec3(0.70, 0.77, 0.95);
+vec3 shade(vec2 F, float aa){
+  float outer = 1.0 - smoothstep(-aa, aa, F.x);
+  float core = 1.0 - smoothstep(-aa, aa, F.y);
+  vec3 c = mix(RIM, CORE, core);
+  return c * outer;
+}
 void main(){
   vec2 fc = gl_FragCoord.xy;
   bool portrait = uRes.x < uRes.y;
-  float unit = min(uRes.y*0.98, uRes.x*(portrait ? 1.05 : 1.30)) * 0.68;
-  vec2 base = vec2(uRes.x*0.5, uRes.y*(portrait ? 0.30 : 0.15));
+  float unit = min(uRes.y*0.98, uRes.x*(portrait ? 1.15 : 1.4)) * 0.50;
+  vec2 base = vec2(uRes.x*0.5, uRes.y*(portrait ? 0.40 : 0.36));
   vec2 p = (fc - base) / unit;
-  vec3 col = vec3(0.004, 0.004, 0.006);
-  float H = flameH(uPulse);
-  float pulseLight = 1.0 + 0.35*uPulse*uPulseAmt;
+  float aa = 1.2 / unit;
+  vec3 col = BG + vec3(0.010,0.010,0.020) * (1.0 - length((fc/uRes - vec2(0.5,0.55))*vec2(1.0,1.3)));
 
-  // heat shimmer from the highs (only affects the upper flame)
-  vec2 ps = p;
-  ps.x += sin(p.y*42.0 - uT*5.0 + sin(p.x*18.0)) * 0.0022 * smoothstep(0.45, 1.0, p.y/H) * (0.3 + uHi);
+  // ---------- flame ----------
+  vec2 F = vec2(1.0);
+  if (p.y > -0.01) F = flame(p);
+  float body = 1.0 - smoothstep(-aa, aa, F.x);
+  float glow = exp(-max(F.x, 0.0) * 18.0) * 0.50 + exp(-max(F.x, 0.0) * 5.0) * 0.14;
+  if (p.y < 0.0) glow *= exp(p.y*20.0);
 
-  // ---------- the painted flame ----------
-  vec2 uv = burn(toUV(ps, H), uT);
-  vec4 F = tex(uv, 0.0);
-  // gentle rising internal brightness variation (the flame "burns" inside)
-  float inner = 0.90 + 0.16*fbm(vec2(uv.x*5.0, uv.y*2.2 - uT*0.9));
-  vec3 flame = F.rgb * inner * 0.96 * pulseLight;
-  float occ = F.a;                                   // flame silhouette, hides things behind it
-
-  // ---------- floor ----------
-  float pool = exp(-(p.x*p.x*2.2 + p.y*p.y*55.0)) * 0.20 * (0.6+0.4*uGlow) * pulseLight;
-  col += vec3(0.86,0.88,0.94) * pool;
-  // ripples: concentric ellipses in perspective, from the base
-  {
-    vec2 e = vec2(p.x, p.y*4.5);
-    float r = length(e), acc = 0.0;
+  // ---------- floor: ripples + gritty reflection ----------
+  if (p.y < 0.0) {
+    float depth = -p.y;
+    // floor texture: faint dark grain
+    float grain = h2(floor(fc*0.5));
+    col += vec3(0.010,0.010,0.022) * grain * exp(-depth*3.0);
+    // ripples (concentric ellipses in perspective) on drum hits; they also wobble the reflection
+    vec2 e = vec2(p.x, p.y*4.2);
+    float r = length(e), ring = 0.0, wob = 0.0;
     for (int i=0;i<${NR};i++){
       vec3 R = uR[i]; if (R.y <= 0.0) continue;
-      float age = R.x, rad = 0.26 + age*0.55, w = 0.010 + age*0.016;
-      float life = clamp(1.0 - age/3.6, 0.0, 1.0);
-      acc += exp(-pow((r - rad)/w, 2.0)) * R.y * life*life * (0.35 + 0.65*smoothstep(0.0,0.4,age));
+      float age = R.x, rad = 0.12 + age*0.42, w = 0.008 + age*0.010;
+      float life = clamp(1.0 - age/3.2, 0.0, 1.0);
+      float g = exp(-pow((r - rad)/w, 2.0)) * R.y * life*life * smoothstep(0.0, 0.25, age);
+      ring += g; wob += sin((r - rad)*70.0) * exp(-pow((r - rad)/(w*3.0), 2.0)) * R.y * life;
     }
-    float behind = mix(1.0, 0.55, smoothstep(-0.01, 0.03, p.y));
-    col += vec3(0.80,0.84,0.92) * acc * 0.085 * uRipple * behind * smoothstep(3.0, 0.5, r);
-  }
-  // reflection: mirrored, blurred, fading into the floor
-  if (p.y < 0.0) {
-    vec2 rp = vec2(p.x + sin(p.y*70.0 + uT*1.2)*0.003, -p.y*1.25);
-    vec2 ruv = burn(toUV(rp, H), uT);
-    float fade = exp(p.y*9.0);
-    col += tex(ruv, 4.5).rgb * 0.26 * fade * pulseLight;
-    col += vec3(1.0) * exp(-pow(p.y/0.018,2.0)) * exp(-p.x*p.x*9.0) * 0.08 * pulseLight;   // contact light
+    col += vec3(0.75,0.82,1.0) * ring * 0.22 * uRipple * smoothstep(3.0, 0.4, r);
+    // mirrored, squashed, distorted reflection with a sparkly grit like the reference
+    vec2 rp = vec2(p.x + sin(depth*90.0)*0.006 + wob*0.012*uRipple, depth*2.3);
+    vec2 RF = flame(rp);
+    vec3 refl = shade(RF, aa*3.0);
+    // soft mottled grit (smooth noise, not per-pixel static) + a few sparkles, like the reference's wet floor
+    vec2 gp = vec2(p.x*38.0, depth*90.0);
+    float mott = pn(gp, 1000.0)*0.6 + pn(gp*2.3 + 5.0, 1000.0)*0.4;
+    float grit = 0.45 + 0.75*smoothstep(0.35, 0.75, mott) + 0.6*step(0.93, h2(floor(gp*1.7)));
+    float fade = exp(-depth*4.0);
+    col += refl * grit * fade * 0.55;
+    col += GLOW * exp(-max(RF.x,0.0)*10.0) * fade * 0.08 * uGlow;
   }
 
-  // ---------- glow (mids/pad + bass pulse) ----------
-  vec2 guv = toUV(p, H);
-  vec3 g1 = tex(guv, 2.2).rgb, g2 = tex(vec2((guv.x-0.5)*0.8+0.5, guv.y*0.9), 5.5).rgb;
-  float gk = uGlow * (0.70 + 0.55*uPulse*uPulseAmt);
-  vec3 glow = (g1*0.22 + g2*0.30) * gk * (p.y < 0.0 ? 0.5 : 1.0);
-  // soft atmospheric halo
-  float gd = length((p - vec2(0.0, 0.42*H)) * vec2(1.4, 0.9) / H);
-  glow += vec3(0.80,0.84,0.95) * exp(-gd*gd*2.0) * 0.06 * gk;
-
-  // ---------- embers: small bright sparks rising around the flame ----------
-  {
-    float acc = 0.0;
-    for (int i=0;i<64;i++){
-      if (float(i) >= uEmbers) break;
-      float fi = float(i);
-      float per = 5.0 + 4.0*h1(fi+1.3);
-      float ph = fract(uT/per + h1(fi+7.7));
-      float side = h1(fi+3.1) - 0.5;
-      float x0 = side * 0.95 * (0.30 + 0.70*h1(fi+4.4));
-      vec2 ep = vec2(x0*(1.0 - ph*0.45) + 0.035*sin(uT*(0.5+h1(fi+9.0)) + fi)*ph, (0.20 + 0.45*h1(fi+6.6) + ph*0.95)) * uSize;
-      float sz = (0.0028 + 0.0035*h1(fi+5.5));
-      vec2 d = (p - ep) * vec2(1.0, 0.55);                // slightly elongated vertically, like the painting
-      float al = smoothstep(0.0,0.12,ph) * smoothstep(1.0,0.6,ph) * (0.45+0.55*h1(fi+2.2)) * (0.75 + 0.25*sin(uT*3.0 + fi*2.1));
-      float dd = length(d);
-      acc += (exp(-pow(dd/sz,2.0))*1.3 + exp(-dd/(sz*2.5))*0.12) * al;
-    }
-    col += vec3(0.96,0.97,1.0) * acc;
-  }
-  // faint air sparkle (highs)
-  {
-    vec2 g = p*60.0; vec2 id = floor(g); float rnd = h2(id);
-    if (rnd > 0.988 && p.y > 0.0) {
-      vec2 f = fract(g) - 0.5;
-      float tw = pow(0.5+0.5*sin(uT*2.0 + rnd*80.0), 6.0);
-      float near = exp(-length((p - vec2(0.,0.55*H))*vec2(1.2,0.8))*1.8);
-      col += vec3(0.9,0.93,1.0) * exp(-dot(f,f)*40.0) * tw * near * (0.04 + 0.20*uHi);
-    }
-  }
-
-  // composite: things behind the flame are hidden by its body, the painted flame is added on top
-  col *= (1.0 - 0.85*occ);
-  col += glow + flame;
-  col = 1.0 - exp(-col*1.6);
-  col += (h2(fc + fract(uT)*91.0) - 0.5)/255.0;
+  // composite flame: flat cel colours + soft cool glow
+  col += GLOW * glow * 0.55 * uGlow * (1.0 - body);
+  col = mix(col, shade(F, aa), body);
+  col += (h2(fc*1.37) - 0.5)/255.0;
   o = vec4(col, 1.0);
 }`;
 function sh(type, src){ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
@@ -195,19 +185,18 @@ gl.bindAttribLocation(prog, 0, 'a'); gl.linkProgram(prog); gl.useProgram(prog);
 const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
 gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-const U = {}; for (const n of ['uTex','uRes','uT','uAsp','uSize','uPulseAmt','uFlicker','uGlow','uRipple','uEmbers','uPulse','uHi','uR']) U[n] = gl.getUniformLocation(prog, n);
+const U = {}; for (const n of ['uTex','uRes','uPh','uSdfRange','uSdfRange2','uSdfAsp','uSdfTop','uSize','uFlicker','uRim','uGlow','uRipple','uR']) U[n] = gl.getUniformLocation(prog, n);
 
-// flame texture (cut from the painted reference)
+// silhouette SDF (Espen's painted flame outline, see tools/make_sdf.py)
 let texReady = false;
 const texP = new Promise((res, rej) => { const img = new Image(); img.onload = () => {
   const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-  gl.generateMipmap(gl.TEXTURE_2D);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.uniform1i(U.uTex, 0); texReady = true; res(); }; img.onerror = rej; img.src = 'flame_tex.png'; });
+  gl.uniform1i(U.uTex, 0); texReady = true; res(); }; img.onerror = rej; img.src = 'flame_sdf.png'; });
 
 function resize(){
   const dpr = RENDER ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
@@ -246,30 +235,26 @@ function calibrate(){ // per-band 92nd percentile over the loop, so reactions ar
   for (const k in vals){ const a = vals[k].sort((x,y)=>x-y); REF[k] = Math.max(a[Math.floor(a.length*0.92)], 1e-6); }
 }
 
-// ---------- drum pulse, driven by the precomputed timeline (not live FFT) ----------
-// Each onset of the deep drum stem gives a soft ~90 ms swell and a slow ease back, plus one floor ripple.
-const PULSE_ATTACK = 0.09, PULSE_DECAY = 0.55, RIPPLE_LIFE = 3.6;
-let loopDur = 5;                       // length of the audio loop currently playing (clip or full)
-const S = { pulse:0, hi:0 };
-const ease = (tau, dt) => 1 - Math.exp(-dt / tau);
-const ripples = [];                    // [{age, s}]
+// ---------- drum-timed floor ripples (precomputed drum timeline; the only audio reaction) ----------
+const RIPPLE_LIFE = 3.2;
+let loopDur = 4.444444;               // length of the audio loop currently playing (clip or full)
+const ripples = [];                   // [{age, s}]
+let phase = 0;                        // flame loop phase 0..1, locked to whole bars of the music
+function barLen(){ return 240 / (TL.bpm || 108); }
 function activeOnsets(){ return TL.onsets.filter(o => o.t < loopDur - 1e-3); }
-function timelineState(tl){            // tl = position inside the loop, seconds
-  let pulse = 0; ripples.length = 0;
-  for (const o of activeOnsets()){
-    const age = ((tl - o.t) % loopDur + loopDur) % loopDur;       // wraps across the loop seam
-    const a = Math.min(age / PULSE_ATTACK, 1), sm = a*a*(3-2*a);
-    pulse = Math.max(pulse, o.s * sm * Math.exp(-Math.max(age - PULSE_ATTACK*0.5, 0) / PULSE_DECAY));
-    if (age < RIPPLE_LIFE) ripples.push({ age, s: 0.55 + 0.45*o.s });
+function react(_unused, dt, tl, tFree){
+  ripples.length = 0;
+  if (tl != null){
+    for (const o of activeOnsets()){
+      const age = ((tl - o.t) % loopDur + loopDur) % loopDur;      // wraps across the loop seam
+      if (age < RIPPLE_LIFE) ripples.push({ age, s: 0.6 + 0.4*o.s });
+    }
+    ripples.sort((x,y)=>x.age-y.age); ripples.length = Math.min(ripples.length, NR);
   }
-  ripples.sort((x,y)=>x.age-y.age); ripples.length = Math.min(ripples.length, NR);
-  return pulse;
-}
-function react(hiBand, dt, tl){
-  S.pulse = tl == null ? 0 : timelineState(tl);
-  const H = Math.min(hiBand/REF.hi, 1.6);
-  S.hi += (H - S.hi) * ease(0.5, dt);
-  window.__meters = { pulse:S.pulse, H };
+  const t = tl != null ? tl : tFree;
+  const period = barLen() * Math.max(1, Math.round(P.loopBars));
+  phase = (t % period) / period;
+  window.__meters = { phase, ripples: ripples.length };
 }
 
 const rArr = new Float32Array(NR*3);
@@ -277,11 +262,10 @@ function draw(t){
   resize();
   rArr.fill(0);
   ripples.forEach((r,i)=> rArr.set([r.age, r.s, 0], i*3));
-  gl.uniform2f(U.uRes, cv.width, cv.height); gl.uniform1f(U.uT, t); gl.uniform1f(U.uAsp, TEX_ASPECT);
-  gl.uniform1f(U.uSize, P.size); gl.uniform1f(U.uPulseAmt, P.pulse); gl.uniform1f(U.uFlicker, P.flicker); gl.uniform1f(U.uGlow, P.glow);
-  gl.uniform1f(U.uRipple, P.ripple); gl.uniform1f(U.uEmbers, P.embers);
-  gl.uniform1f(U.uPulse, Math.min(S.pulse,1.3)); gl.uniform1f(U.uHi, Math.min(S.hi,1.3));
-  gl.uniform3fv(U.uR, rArr);
+  gl.uniform2f(U.uRes, cv.width, cv.height); gl.uniform1f(U.uPh, phase);
+  gl.uniform1f(U.uSdfRange, SDF_RANGE); gl.uniform1f(U.uSdfRange2, 0.5*764/680); gl.uniform1f(U.uSdfAsp, SDF_PX_PER_UNIT/SDF_W); gl.uniform1f(U.uSdfTop, SDF_PX_PER_UNIT/SDF_H);
+  gl.uniform1f(U.uSize, P.size); gl.uniform1f(U.uFlicker, P.flicker); gl.uniform1f(U.uRim, P.rim); gl.uniform1f(U.uGlow, P.glow);
+  gl.uniform1f(U.uRipple, P.ripple); gl.uniform3fv(U.uR, rArr);
   if (texReady) gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
@@ -301,7 +285,7 @@ async function startAudio(){
   if (!actx){ actx = new (window.AudioContext || window.webkitAudioContext)(); analyser = actx.createAnalyser();
     analyser.fftSize = FFT_N; analyser.smoothingTimeConstant = 0; analyser.minDecibels = -140; analyser.maxDecibels = 0; analyser.connect(actx.destination); }
   if (actx.state !== 'running') await actx.resume();
-  const buf = await loadBuffer(name, actx); setMono(buf);
+  const buf = await loadBuffer(name, actx);
   if (src) { try { src.stop(); } catch(e){} }
   src = actx.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(analyser);
   await tlP; loopDur = buf.duration;
@@ -317,33 +301,33 @@ function frame(now){
     // visual time = what is being heard now: audio clock minus output latency, folded into the loop
     const lat = (actx.outputLatency || 0) + (actx.baseLatency || 0);
     const tl = Math.max(actx.currentTime - startAt - lat, 0) % loopDur;
-    react(bandsFromDb(floatDb).hi, dt, tl); }
-  else react(0, dt, null);   // calm burning before the tap
+    react(0, dt, tl, 0); }
+  else react(0, dt, null, tScene);   // flame loops on its own before the tap
   draw(tScene);
   if (devEl.classList.contains('show') && window.__meters){ const m = window.__meters;
-    metersEl.textContent = `drum pulse ${m.pulse.toFixed(2)}  high ${m.H.toFixed(2)}\ntimeline: ${TL.track || '?'} (${activeOnsets().length} hits/loop)`; }
+    metersEl.textContent = `flame phase ${m.phase.toFixed(2)}  ripples ${m.ripples}\ntimeline: ${TL.track || '?'} (${activeOnsets().length} drum hits/loop)`; }
   requestAnimationFrame(frame);
 }
 
 // ---------- offline deterministic render API (used for the MP4 preview) ----------
 window.__prepRender = async (name) => { await texP; await tlP; const ctx = new OfflineAudioContext(2, 44100, 44100);
-  const buf = await loadBuffer(name || 'clip', ctx); setMono(buf); loopDur = buf.duration; return buf.duration; };
+  const buf = await loadBuffer(name || 'clip', ctx); loopDur = buf.duration; return buf.duration; };
 window.__renderFrame = (i, fps) => { const dt = 1/fps, t = i*dt;
-  const tl = t % loopDur; react(bandsFromDb(offlineDb(t)).hi, dt, tl); draw(t); gl.finish();
+  const tl = t % loopDur; react(0, dt, tl, t); draw(t); gl.finish();
   const newHit = activeOnsets().some(o => { const age = ((tl - o.t) % loopDur + loopDur) % loopDur; return age < dt; });
-  return { waves: 0, ripples: newHit ? 1 : 0, pulse: S.pulse }; };
+  return { waves: 0, ripples: newHit ? 1 : 0, pulse: phase }; };
 
 // ---------- dev panel ----------
 const devEl = document.getElementById('dev'), metersEl = document.getElementById('meters'), valsEl = document.getElementById('vals');
 const slEl = document.getElementById('sliders');
-function showVals(){ valsEl.value = Object.entries(P).map(([k,v])=>`${k}=${(+v).toFixed(k==='embers'?0:2)}`).join('&');
-  for (const k in P){ const e = document.getElementById('v_'+k); if (e) e.textContent = (+P[k]).toFixed(k==='embers'?0:2); } }
+function showVals(){ valsEl.value = Object.entries(P).map(([k,v])=>`${k}=${(+v).toFixed(k==='loopBars'?0:2)}`).join('&');
+  for (const k in P){ const e = document.getElementById('v_'+k); if (e) e.textContent = (+P[k]).toFixed(k==='loopBars'?0:2); } }
 for (const k in P){ const [mn,mx,st] = RANGES[k];
   slEl.insertAdjacentHTML('beforeend', `<label>${LABEL[k]} <span class="v" id="v_${k}"></span></label><input type="range" id="s_${k}" min="${mn}" max="${mx}" step="${st}" value="${P[k]}">`); }
 for (const k in P) document.getElementById('s_'+k).addEventListener('input', e => { P[k] = parseFloat(e.target.value); showVals(); });
 document.getElementById('reset').onclick = () => { Object.assign(P, DEFAULTS); for (const k in P) document.getElementById('s_'+k).value = P[k]; showVals(); };
 const modeBtn = document.getElementById('mode');
-function updateModeBtn(){ modeBtn.textContent = FULL ? 'Audio: full 60 s' : 'Audio: first 5 s'; }
+function updateModeBtn(){ modeBtn.textContent = FULL ? 'Audio: full 60 s' : 'Audio: first 2 bars'; }
 modeBtn.onclick = () => { FULL = !FULL; updateModeBtn(); if (playing) startAudio(); };
 updateModeBtn(); showVals();
 const toggleDev = () => devEl.classList.toggle('show');
